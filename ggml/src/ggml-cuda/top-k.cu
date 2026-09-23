@@ -228,12 +228,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if defined(GGML_CUDA_USE_CUB)
     // Serial top-k launches one pass per row and leaves the GPU idle. For big multi-row inputs (indexer top-k
     // at prefill) the parallel radix kernel wins despite reading the data more times.
-    // Kill-switch LLAMA_CUDA_TOPK_RADIX=0 forces the serial path.
-    static const int env_radix = []() {
-        const char * s = getenv("LLAMA_CUDA_TOPK_RADIX");
-        return s ? atoi(s) : -1;
-    }();
-    if (ncols > 1024 && nrows >= 16 && env_radix != 0) {
+    if (ncols > 1024 && nrows >= 16) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
