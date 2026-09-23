@@ -225,53 +225,49 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
-#if defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
-    // Serial top-k launches one pass per row. For big multi-row inputs (indexer top-k at prefill)
-    // the parallel radix kernel wins despite reading the data more times: the serial loop leaves the GPU idle.
-    // Kill-switch LLAMA_CUDA_TOPK_RADIX=0 forces the serial path for A/B; unset = enabled.
+#if defined(GGML_CUDA_USE_CUB)
+    // Serial top-k launches one pass per row and leaves the GPU idle. For big multi-row inputs (indexer top-k
+    // at prefill) the parallel radix kernel wins despite reading the data more times.
+    // Kill-switch LLAMA_CUDA_TOPK_RADIX=0 forces the serial path.
     static const int env_radix = []() {
         const char * s = getenv("LLAMA_CUDA_TOPK_RADIX");
         return s ? atoi(s) : -1;
     }();
+    if (ncols > 1024 && nrows >= 16 && env_radix != 0) {
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
 #endif
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
-    if (ncols > 1024 && nrows >= 16 && env_radix != 0) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
-    } else {
-        for (int i = 0; i < nrows; i++) {
-            top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
-        }
+    for (int i = 0; i < nrows; i++) {
+        top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
-    if (ncols > 1024 && nrows >= 16 && env_radix != 0) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
-    } else {
-        // Fall back to argsort + copy
-        const int    ncols_pad      = next_power_of_2(ncols);
-        const size_t shared_mem     = ncols_pad * sizeof(int);
-        const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
-        const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
-        const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+    // Fall back to argsort + copy
+    const int    ncols_pad      = next_power_of_2(ncols);
+    const size_t shared_mem     = ncols_pad * sizeof(int);
+    const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+    const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
+    const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
 
-        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
-        int *                     tmp_dst = temp_dst_alloc.get();
+    ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
+    int *                     tmp_dst = temp_dst_alloc.get();
 
-        for (int64_t i = 0; i < nrows; i += chunk_nrows) {
-            int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
+    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+        int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
 
-            if (use_bitonic) {
-                argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
-            } else {
-                argsort_f32_i32_cuda_cub(pool, src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
-            }
-            CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), iter_nrows,
-                                         cudaMemcpyDeviceToDevice, stream));
-
-            src0_d += ncols * iter_nrows;
-            dst_d  += k     * iter_nrows;
+        if (use_bitonic) {
+            argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+        } else {
+            argsort_f32_i32_cuda_cub(pool, src0_d, tmp_dst, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
         }
+        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), iter_nrows,
+                                     cudaMemcpyDeviceToDevice, stream));
+
+        src0_d += ncols * iter_nrows;
+        dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
